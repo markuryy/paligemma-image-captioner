@@ -1,6 +1,6 @@
 # PaliGemma Image Captioner
 
-This repository contains a GUI application for image captioning using the PaliGemma model. The application allows for both single image and batch processing, with options to use local models or models from Hugging Face.
+This repository contains a GUI application for image captioning using your own finetune of the PaliGemma model. The application allows for both single image and batch processing, with options to use local models or models from Hugging Face.
 
 ## Features
 
