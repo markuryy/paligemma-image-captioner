@@ -2,9 +2,9 @@ import sys
 import os
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLineEdit, QTextEdit, QLabel, QFileDialog, QProgressBar, 
-                             QListWidget, QMessageBox, QInputDialog, QSizePolicy)
+                             QListWidget, QMessageBox, QInputDialog, QSizePolicy, QComboBox, QScrollArea)
 from PyQt6.QtGui import QPixmap, QFont
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
 import torch
 from transformers import PaliGemmaForConditionalGeneration, PaliGemmaProcessor
 from PIL import Image
@@ -13,6 +13,7 @@ class InferenceWorker(QObject):
     progress = pyqtSignal(int)
     result = pyqtSignal(str, str)
     finished = pyqtSignal()
+    error = pyqtSignal(str)
 
     def __init__(self, model, processor, image_paths, text):
         super().__init__()
@@ -22,34 +23,37 @@ class InferenceWorker(QObject):
         self.text = text
 
     def run(self):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = self.model.to(device)
-        self.model.eval()
+        try:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model = self.model.to(device)
+            self.model.eval()
 
-        for i, image_path in enumerate(self.image_paths):
-            image = Image.open(image_path)
-            inputs = self.processor(text=self.text, images=image, return_tensors="pt").to(device)
+            for i, image_path in enumerate(self.image_paths):
+                image = Image.open(image_path)
+                inputs = self.processor(text=self.text, images=image, return_tensors="pt").to(device)
 
-            with torch.inference_mode():
-                generated_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=128,
-                    do_sample=False
-                )
-            
-            result = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
-            output = result[0][len(self.text):].lstrip("\n")
+                with torch.inference_mode():
+                    generated_ids = self.model.generate(
+                        **inputs,
+                        max_new_tokens=128,
+                        do_sample=False
+                    )
+                
+                result = self.processor.batch_decode(generated_ids, skip_special_tokens=True)
+                output = result[0][len(self.text):].lstrip("\n")
 
-            self.result.emit(image_path, output)
-            self.progress.emit(int((i + 1) / len(self.image_paths) * 100))
+                self.result.emit(image_path, output)
+                self.progress.emit(int((i + 1) / len(self.image_paths) * 100))
 
-        self.finished.emit()
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
 
 class PaliGemmaGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PaliGemma Image Captioning")
-        self.setGeometry(100, 100, 800, 600)
+        self.setWindowTitle("Markury's PaliGemma Image Captioner")
+        self.setGeometry(100, 100, 1000, 800)
 
         self.model = None
         self.processor = None
@@ -68,16 +72,31 @@ class PaliGemmaGUI(QMainWindow):
         self.model_path_input = QLineEdit()
         self.model_path_input.setPlaceholderText("Enter local model path or Hugging Face model ID")
         model_layout.addWidget(self.model_path_input)
+        
+        # Add model suggestions
+        self.model_suggestions = QComboBox()
+        self.model_suggestions.addItem("Preset models")
+        self.model_suggestions.addItem("google/paligemma-3b-mix-448")
+        self.model_suggestions.addItem("markury/paligemma-448-ft-1")
+        self.model_suggestions.currentIndexChanged.connect(self.update_model_input)
+        model_layout.addWidget(self.model_suggestions)
+        
         load_model_btn = QPushButton("Load Model")
         load_model_btn.clicked.connect(self.load_model)
         model_layout.addWidget(load_model_btn)
         main_layout.addLayout(model_layout)
 
+        # Loading indicator
+        self.loading_label = QLabel("Loading...")
+        self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.loading_label.setVisible(False)
+        main_layout.addWidget(self.loading_label)
+
         # Tabs
-        tabs = QTabWidget()
-        tabs.addTab(self.create_single_image_tab(), "Single Image")
-        tabs.addTab(self.create_batch_processing_tab(), "Batch Processing")
-        main_layout.addWidget(tabs)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.create_single_image_tab(), "Single Image")
+        self.tabs.addTab(self.create_batch_processing_tab(), "Batch Processing")
+        main_layout.addWidget(self.tabs)
 
         main_widget.setLayout(main_layout)
         self.setCentralWidget(main_widget)
@@ -148,17 +167,37 @@ class PaliGemmaGUI(QMainWindow):
         self.progress_bar = QProgressBar()
         layout.addWidget(self.progress_bar)
 
-        # Results list
+        # Results list and image preview
+        results_layout = QHBoxLayout()
+        
         self.results_list = QListWidget()
+        self.results_list.itemClicked.connect(self.show_batch_image_preview)
         self.results_list.itemDoubleClicked.connect(self.edit_caption)
-        layout.addWidget(self.results_list)
+        results_layout.addWidget(self.results_list, 2)
+        
+        self.batch_image_preview = QLabel()
+        self.batch_image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.batch_image_preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        results_layout.addWidget(self.batch_image_preview, 1)
+        
+        layout.addLayout(results_layout)
 
         tab.setLayout(layout)
         return tab
 
+    def update_model_input(self, index):
+        if index > 0:
+            self.model_path_input.setText(self.model_suggestions.currentText())
+
     def load_model(self):
         model_path = self.model_path_input.text()
+        self.loading_label.setVisible(True)
+        QApplication.processEvents()
+
         try:
+            if model_path.lower().endswith('.npz'):
+                raise ValueError("NPZ files are not supported. Please convert to safetensors using the provided Colab notebook.")
+            
             if os.path.isdir(model_path):
                 self.model = PaliGemmaForConditionalGeneration.from_pretrained(model_path)
                 self.processor = PaliGemmaProcessor.from_pretrained(model_path)
@@ -168,17 +207,19 @@ class PaliGemmaGUI(QMainWindow):
             QMessageBox.information(self, "Success", "Model loaded successfully!")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load model: {str(e)}")
+        finally:
+            self.loading_label.setVisible(False)
 
     def select_image(self):
         file_dialog = QFileDialog()
         image_path, _ = file_dialog.getOpenFileName(self, "Select Image", "", "Image Files (*.png *.jpg *.jpeg)")
         if image_path:
             self.image_path_input.setText(image_path)
-            self.update_image_preview(image_path)
+            self.update_image_preview(image_path, self.image_preview)
 
-    def update_image_preview(self, image_path):
+    def update_image_preview(self, image_path, preview_label):
         pixmap = QPixmap(image_path)
-        self.image_preview.setPixmap(pixmap.scaled(400, 400, Qt.AspectRatioMode.KeepAspectRatio))
+        preview_label.setPixmap(pixmap.scaled(400, 400, Qt.AspectRatioMode.KeepAspectRatio))
 
     def generate_single_caption(self):
         if not self.model or not self.processor:
@@ -192,6 +233,9 @@ class PaliGemmaGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please provide an image path.")
             return
 
+        self.loading_label.setVisible(True)
+        QApplication.processEvents()
+
         self.thread = QThread()
         self.worker = InferenceWorker(self.model, self.processor, [image_path], text)
         self.worker.moveToThread(self.thread)
@@ -200,8 +244,10 @@ class PaliGemmaGUI(QMainWindow):
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(lambda: self.loading_label.setVisible(False))
         
         self.worker.result.connect(self.update_single_result)
+        self.worker.error.connect(self.show_error)
         
         self.thread.start()
 
@@ -229,6 +275,9 @@ class PaliGemmaGUI(QMainWindow):
         image_paths = [os.path.join(folder_path, f) for f in os.listdir(folder_path) 
                        if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
+        self.loading_label.setVisible(True)
+        QApplication.processEvents()
+
         self.thread = QThread()
         self.worker = InferenceWorker(self.model, self.processor, image_paths, text)
         self.worker.moveToThread(self.thread)
@@ -237,9 +286,11 @@ class PaliGemmaGUI(QMainWindow):
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(lambda: self.loading_label.setVisible(False))
         
         self.worker.progress.connect(self.update_progress)
         self.worker.result.connect(self.update_batch_result)
+        self.worker.error.connect(self.show_error)
         
         self.thread.start()
 
@@ -255,6 +306,12 @@ class PaliGemmaGUI(QMainWindow):
         with open(txt_path, 'w') as f:
             f.write(output)
 
+    def show_batch_image_preview(self, item):
+        image_name = item.text().split(':')[0].strip()
+        folder_path = self.folder_path_input.text()
+        image_path = os.path.join(folder_path, image_name)
+        self.update_image_preview(image_path, self.batch_image_preview)
+
     def edit_caption(self, item):
         old_text = item.text()
         new_text, ok = QInputDialog.getText(self, "Edit Caption", "Enter new caption:", QLineEdit.EchoMode.Normal, old_text)
@@ -266,6 +323,10 @@ class PaliGemmaGUI(QMainWindow):
             txt_path = os.path.join(folder_path, os.path.splitext(image_name)[0] + '.txt')
             with open(txt_path, 'w') as f:
                 f.write(new_text.split(': ', 1)[1])
+
+    def show_error(self, error_message):
+        QMessageBox.critical(self, "Error", error_message)
+        self.loading_label.setVisible(False)
 
     def apply_styles(self):
         self.setStyleSheet("""
@@ -299,7 +360,7 @@ class PaliGemmaGUI(QMainWindow):
             QPushButton:hover {
                 background-color: #45a049;
             }
-            QLineEdit, QTextEdit {
+            QLineEdit, QTextEdit, QListWidget {
                 border: 1px solid #cccccc;
                 padding: 6px;
                 border-radius: 4px;
@@ -312,11 +373,22 @@ class PaliGemmaGUI(QMainWindow):
             QProgressBar::chunk {
                 background-color: #4CAF50;
             }
+            QLabel#loading_label {
+                font-weight: bold;
+                color: #4CAF50;
+            }
         """)
 
         # Set a modern font
         font = QFont("Segoe UI", 10)
         QApplication.setFont(font)
+
+    def closeEvent(self, event):
+        # Ensure that any running threads are properly closed
+        if self.thread and self.thread.isRunning():
+            self.thread.quit()
+            self.thread.wait()
+        event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
