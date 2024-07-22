@@ -9,6 +9,32 @@ import torch
 from transformers import PaliGemmaForConditionalGeneration, PaliGemmaProcessor
 from PIL import Image
 
+class ModelLoadWorker(QObject):
+    finished = pyqtSignal()
+    model_loaded = pyqtSignal(object, object)
+    error = pyqtSignal(str)
+
+    def __init__(self, model_path):
+        super().__init__()
+        self.model_path = model_path
+
+    def run(self):
+        try:
+            if self.model_path.lower().endswith('.npz'):
+                raise ValueError("NPZ files are not supported. Please convert to safetensors using the provided Colab notebook.")
+            
+            if os.path.isdir(self.model_path):
+                model = PaliGemmaForConditionalGeneration.from_pretrained(self.model_path)
+                processor = PaliGemmaProcessor.from_pretrained(self.model_path)
+            else:
+                model = PaliGemmaForConditionalGeneration.from_pretrained(self.model_path)
+                processor = PaliGemmaProcessor.from_pretrained(self.model_path)
+            self.model_loaded.emit(model, processor)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
 class InferenceWorker(QObject):
     progress = pyqtSignal(int)
     result = pyqtSignal(str, str)
@@ -59,9 +85,12 @@ class PaliGemmaGUI(QMainWindow):
         self.processor = None
         self.thread = None
         self.worker = None
+        self.model_thread = None
+        self.model_worker = None
 
         self.init_ui()
         self.apply_styles()
+        self.init_processing_indicator()
 
     def init_ui(self):
         main_widget = QWidget()
@@ -185,6 +214,19 @@ class PaliGemmaGUI(QMainWindow):
         tab.setLayout(layout)
         return tab
 
+    def init_processing_indicator(self):
+        self.processing_label = QLabel("Processing...")
+        self.processing_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.processing_label.setVisible(False)
+        self.statusBar().addPermanentWidget(self.processing_label)
+
+    def show_processing_indicator(self):
+        self.processing_label.setVisible(True)
+        QApplication.processEvents()
+
+    def hide_processing_indicator(self):
+        self.processing_label.setVisible(False)
+
     def update_model_input(self, index):
         if index > 0:
             self.model_path_input.setText(self.model_suggestions.currentText())
@@ -194,21 +236,25 @@ class PaliGemmaGUI(QMainWindow):
         self.loading_label.setVisible(True)
         QApplication.processEvents()
 
-        try:
-            if model_path.lower().endswith('.npz'):
-                raise ValueError("NPZ files are not supported. Please convert to safetensors using the provided Colab notebook.")
-            
-            if os.path.isdir(model_path):
-                self.model = PaliGemmaForConditionalGeneration.from_pretrained(model_path)
-                self.processor = PaliGemmaProcessor.from_pretrained(model_path)
-            else:
-                self.model = PaliGemmaForConditionalGeneration.from_pretrained(model_path)
-                self.processor = PaliGemmaProcessor.from_pretrained(model_path)
-            QMessageBox.information(self, "Success", "Model loaded successfully!")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load model: {str(e)}")
-        finally:
-            self.loading_label.setVisible(False)
+        self.model_thread = QThread()
+        self.model_worker = ModelLoadWorker(model_path)
+        self.model_worker.moveToThread(self.model_thread)
+
+        self.model_thread.started.connect(self.model_worker.run)
+        self.model_worker.finished.connect(self.model_thread.quit)
+        self.model_worker.finished.connect(self.model_worker.deleteLater)
+        self.model_thread.finished.connect(self.model_thread.deleteLater)
+        self.model_thread.finished.connect(lambda: self.loading_label.setVisible(False))
+
+        self.model_worker.model_loaded.connect(self.on_model_loaded)
+        self.model_worker.error.connect(self.show_error)
+
+        self.model_thread.start()
+
+    def on_model_loaded(self, model, processor):
+        self.model = model
+        self.processor = processor
+        QMessageBox.information(self, "Success", "Model loaded successfully!")
 
     def select_image(self):
         file_dialog = QFileDialog()
@@ -233,8 +279,7 @@ class PaliGemmaGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please provide an image path.")
             return
 
-        self.loading_label.setVisible(True)
-        QApplication.processEvents()
+        self.show_processing_indicator()
 
         self.thread = QThread()
         self.worker = InferenceWorker(self.model, self.processor, [image_path], text)
@@ -244,7 +289,7 @@ class PaliGemmaGUI(QMainWindow):
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.finished.connect(lambda: self.loading_label.setVisible(False))
+        self.thread.finished.connect(self.hide_processing_indicator)
         
         self.worker.result.connect(self.update_single_result)
         self.worker.error.connect(self.show_error)
@@ -253,6 +298,7 @@ class PaliGemmaGUI(QMainWindow):
 
     def update_single_result(self, image_path, output):
         self.output_text.setText(output)
+        self.hide_processing_indicator()
 
     def select_folder(self):
         folder_dialog = QFileDialog()
@@ -275,8 +321,7 @@ class PaliGemmaGUI(QMainWindow):
         image_paths = [os.path.join(folder_path, f) for f in os.listdir(folder_path) 
                        if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-        self.loading_label.setVisible(True)
-        QApplication.processEvents()
+        self.show_processing_indicator()
 
         self.thread = QThread()
         self.worker = InferenceWorker(self.model, self.processor, image_paths, text)
@@ -286,7 +331,7 @@ class PaliGemmaGUI(QMainWindow):
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.finished.connect(lambda: self.loading_label.setVisible(False))
+        self.thread.finished.connect(self.hide_processing_indicator)
         
         self.worker.progress.connect(self.update_progress)
         self.worker.result.connect(self.update_batch_result)
@@ -305,6 +350,9 @@ class PaliGemmaGUI(QMainWindow):
         txt_path = os.path.splitext(image_path)[0] + '.txt'
         with open(txt_path, 'w') as f:
             f.write(output)
+
+        if self.results_list.count() == len(self.worker.image_paths):
+            self.hide_processing_indicator()
 
     def show_batch_image_preview(self, item):
         image_name = item.text().split(':')[0].strip()
@@ -327,6 +375,7 @@ class PaliGemmaGUI(QMainWindow):
     def show_error(self, error_message):
         QMessageBox.critical(self, "Error", error_message)
         self.loading_label.setVisible(False)
+        self.hide_processing_indicator()
 
     def apply_styles(self):
         self.setStyleSheet("""
@@ -388,6 +437,9 @@ class PaliGemmaGUI(QMainWindow):
         if self.thread and self.thread.isRunning():
             self.thread.quit()
             self.thread.wait()
+        if self.model_thread and self.model_thread.isRunning():
+            self.model_thread.quit()
+            self.model_thread.wait()
         event.accept()
 
 if __name__ == "__main__":
