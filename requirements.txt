@@ -1,3 +1,6 @@
 git+https://github.com/huggingface/transformers.git
 pillow
 PyQt6
+gradio
+psutil
+tqdm
