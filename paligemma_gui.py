@@ -106,7 +106,7 @@ class PaliGemmaGUI(QMainWindow):
         self.model_suggestions = QComboBox()
         self.model_suggestions.addItem("Preset models")
         self.model_suggestions.addItem("google/paligemma-3b-mix-448")
-        self.model_suggestions.addItem("markury/paligemma-448-ft-1")
+        self.model_suggestions.addItem("markury/AndroGemma-alpha")
         self.model_suggestions.currentIndexChanged.connect(self.update_model_input)
         model_layout.addWidget(self.model_suggestions)
         
