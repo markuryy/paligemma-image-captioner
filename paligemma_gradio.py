@@ -43,7 +43,7 @@ class PaliGemmaCaption:
             return "Please load a model first."
 
         try:
-            inputs = self.processor(text=text, images=image, return_tensors="pt").to(self.device)
+            inputs = self.processor(text=text, images=image, return_tensors="pt", padding=True).to(self.device)
             
             with torch.inference_mode():
                 generated_ids = self.model.generate(
